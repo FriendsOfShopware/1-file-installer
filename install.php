@@ -1,0 +1,1072 @@
+<?php
+/**
+ * Shopware 5
+ * Copyright (c) shopware AG
+ *
+ * According to our dual licensing model, this program can be used either
+ * under the terms of the GNU Affero General Public License, version 3,
+ * or under a proprietary license.
+ *
+ * The texts of the GNU Affero General Public License with an additional
+ * permission and of our proprietary license can be found at and
+ * in the LICENSE file you have received along with this program.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * "Shopware" is a registered trademark of shopware AG.
+ * The licensing of the program under the AGPLv3 does not imply a
+ * trademark license. Therefore any rights, title and interest in
+ * our trademarks remain entirely with us.
+ */
+
+error_reporting(E_ALL);
+ini_set('display_errors', true);
+
+const BUFFER_SEPARATOR = ';';
+
+$request = $_REQUEST;
+$host = $_SERVER['HTTP_HOST'] . preg_replace('/\/\?{1}[a-zA-Z=&1-9]*$/', '', $_SERVER['REQUEST_URI']);
+$file = __DIR__ . '/shopware.zip';
+
+$scheme = 'http';
+
+if (isset($_SERVER['REQUEST_SCHEME'])) {
+    $scheme = $_SERVER['REQUEST_SCHEME'];
+} elseif (array_key_exists('HTTPS', $_SERVER) && $_SERVER['HTTPS'] !== 'off' && $_SERVER['HTTPS'] !== '') {
+    $scheme = 'https';
+}
+
+if (array_key_exists('checkRequirements', $request)) {
+
+    if (!function_exists('curl_init')) {
+        throw new \RuntimeException('PHP Extension "curl" is required to download a file.');
+    }
+
+    if (!class_exists('ZipArchive')) {
+        throw new \RuntimeException('PHP Extension "Zip and libzip" is required to unpack a file.');
+    }
+
+    if (!is_writable(__DIR__)) {
+        throw new \RuntimeException(sprintf('The directory "%s" is not writable.', __DIR__));
+    }
+
+    if (file_exists($file)) {
+        unlink($file);
+    }
+
+    echo 'ready';
+    exit();
+}
+
+if (array_key_exists('getVersionData', $request)) {
+    $parameters = ['major' => 6];
+
+    if (isset($_GET['channel'])) {
+        $parameters['channel'] = $_GET['channel'];
+    }
+
+    if (isset($_GET['code'])) {
+        $parameters['code'] = $_GET['code'];
+    }
+
+    $latestVersionUrl = 'https://update-api.shopware.com/v1/releases/install?' . http_build_query($parameters);
+    $data = json_decode(file_get_contents($latestVersionUrl), true);
+
+    if (!is_array($data)) {
+        throw new \RuntimeException('Could not load latest version information from server');
+    }
+
+    $chosenVersion = $data[0];
+
+    if (isset($_GET['version'])) {
+        $found = false;
+
+        foreach ($data as $release) {
+            if ($release['version'] === $_GET['version']) {
+                $chosenVersion = $release;
+                $found = true;
+            }
+        }
+
+        if (!$found) {
+            throw new \RuntimeException('Cannot find matching release');
+        }
+    }
+
+    $version = new Version($chosenVersion);
+    echo json_encode($version);
+    exit();
+}
+
+if (array_key_exists('download', $request)) {
+    $url = $request['url'];
+    $totalSize = $request['totalSize'];
+    $downloader = new Downloader($url, $file, $totalSize);
+    $downloader->download();
+    exit();
+}
+
+if (array_key_exists('compare', $request)) {
+    $sha1 = $request['sha1'];
+    $localSha1 = sha1_file($file);
+
+    if ($sha1 === $localSha1) {
+        echo 'ready';
+        exit();
+    }
+
+    throw new Exception('The downloaded file does not match the original');
+}
+
+if (array_key_exists('fileCount', $request)) {
+    $source = new ZipArchive();
+    $source->open($file);
+    echo $source->numFiles;
+    exit();
+}
+
+if (array_key_exists('unzip', $request)) {
+    $step = $request['step'];
+    $unpack = new Unpack($file, __DIR__, $step);
+    $index = $unpack->unpack();
+
+    if ($index === 'ready') {
+        $filePermissionChanger = new FilePermissionChanger([
+            ['chmod' => 0775, 'filePath' => __DIR__ . '/bin/console'],
+            ['chmod' => 0775, 'filePath' => __DIR__ . '/var/cache/clear_cache.sh'],
+        ]);
+        $filePermissionChanger->changePermissions();
+    }
+
+    echo $index;
+    exit();
+}
+
+if (array_key_exists('deleteSelf', $request)) {
+    unlink(__FILE__);
+    exit();
+}
+
+class Version
+{
+    /** @var string */
+    public $version;
+
+    /** @var string */
+    public $uri;
+
+    /** @var string */
+    public $size;
+
+    /** @var string */
+    public $sha1;
+
+    /**
+     * @param array $versionData
+     *
+     * @throws \RuntimeException
+     */
+    public function __construct(array $versionData)
+    {
+        if (!array_key_exists('version', $versionData)) {
+            throw new \RuntimeException('Could not get "version" from version data');
+        }
+        if (!array_key_exists('uri', $versionData)) {
+            throw new \RuntimeException('Could not get "uri" from version data');
+        }
+        if (!array_key_exists('size', $versionData)) {
+            throw new \RuntimeException('Could not get "size" from version data');
+        }
+        if (!array_key_exists('sha1', $versionData)) {
+            throw new \RuntimeException('Could not get "sha1" from version data');
+        }
+
+        $this->version = $versionData['version'];
+        $this->uri = $versionData['uri'];
+        $this->size = $versionData['size'];
+        $this->sha1 = $versionData['sha1'];
+    }
+}
+
+class Downloader
+{
+    /** @var string */
+    private $url;
+
+    /** @var string */
+    private $file;
+
+    /** @var int */
+    private $totalSize;
+
+    /** @var int */
+    private $stepSize = 1000000;
+
+    /**
+     * @param string $url
+     * @param string $file
+     * @param int $totalSize
+     */
+    public function __construct($url, $file, $totalSize)
+    {
+        $this->url = $url;
+        $this->file = $file;
+        $this->totalSize = $totalSize;
+    }
+
+    /**
+     * Downloads the shopware.zip
+     *
+     * @throws \RuntimeException
+     */
+    public function download()
+    {
+        if (!$fileStream = fopen($this->file, 'ab+')) {
+            throw new \RuntimeException('Could not open ' . $this->file);
+        }
+
+        if (filesize($this->file) >= $this->totalSize) {
+            fclose($fileStream);
+            echo 'ready';
+            return;
+        }
+
+        $range = filesize($this->file) . '-' . (filesize($this->file) + $this->stepSize);
+
+        $resource = curl_init();
+        curl_setopt($resource, CURLOPT_URL, $this->url);
+        curl_setopt($resource, CURLOPT_RANGE, $range);
+        curl_setopt($resource, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($resource, CURLOPT_NOPROGRESS, false);
+        curl_setopt($resource, CURLOPT_HEADER, 0);
+        curl_setopt($resource, CURLOPT_FILE, $fileStream);
+        curl_setopt($resource, CURLOPT_USERAGENT, $_SERVER['HTTP_USER_AGENT']);
+        curl_exec($resource);
+        curl_close($resource);
+
+        fclose($fileStream);
+
+        echo filesize($this->file);
+    }
+}
+
+class Unpack
+{
+    /** @var string */
+    private $directory;
+
+    /** @var string */
+    private $file;
+
+    /** @var int */
+    private $index;
+
+    /** @var int */
+    private $stepSize = 500;
+
+    /**
+     * @param string $file
+     * @param string $directory
+     * @param int $currentIndex
+     *
+     * @throws \RuntimeException
+     */
+    public function __construct($file, $directory, $currentIndex)
+    {
+        $this->index = 0;
+        $this->file = $file;
+        $this->directory = $directory . '/';
+        $this->index = $currentIndex;
+
+        if (!file_exists($this->file)) {
+            throw new \RuntimeException(sprintf('The file: "%s" does not exists.', $this->file));
+        }
+    }
+
+    /**
+     * Unpacks the shopware.zip file
+     *
+     * @throws \RuntimeException
+     *
+     * @return int|string
+     */
+    public function unpack()
+    {
+        $zipFile = new ZipArchive();
+        $zipFile->open($this->file);
+
+        $next = $this->index + $this->stepSize;
+
+        while ($this->index < $next) {
+            if ($this->index >= $zipFile->numFiles) {
+                $zipFile->close();
+                $this->deleteFile($this->file);
+                $this->deleteFile($this->directory . '/index.php');
+                return 'ready';
+            }
+
+            $zipFile->extractTo($this->directory, $zipFile->getNameIndex($this->index));
+            $this->index++;
+        }
+
+        $zipFile->close();
+
+        return $this->index;
+    }
+
+    /**
+     * @param string $file
+     * @throws \RuntimeException
+     */
+    private function deleteFile($file)
+    {
+        if (file_exists($file)) {
+            unlink($file);
+        }
+
+        if (file_exists($file)) {
+            throw new \RuntimeException(sprintf('The file "%s" could not deleted. ', $file));
+        }
+    }
+}
+
+class FilePermissionChanger
+{
+    /**
+     * Format:
+     * [
+     *      ['chmod' => 0755, 'filePath' => '/path/to/some/file'],
+     * ]
+     *
+     * @var array
+     */
+    private $filePermissions;
+
+    /**
+     * @param array
+     */
+    public function __construct(array $filePermissions)
+    {
+        $this->filePermissions = $filePermissions;
+    }
+
+    /**
+     * Performs the chmod command on all permission arrays previously provided.
+     */
+    public function changePermissions()
+    {
+        foreach ($this->filePermissions as $filePermission) {
+            if (array_key_exists('filePath', $filePermission) &&
+                array_key_exists('chmod', $filePermission) &&
+                is_writable($filePermission['filePath'])) {
+                chmod($filePermission['filePath'], $filePermission['chmod']);
+            }
+        }
+    }
+}
+?>
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8"/>
+    <meta name="robots" content="noindex, nofollow"/>
+    <title>Shopware 1-File Installer</title>
+    <link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgBAMAAACBVGfHAAAABGdBTUEAALGPC/xhBQAAAAFzUkdCAK7OHOkAAAAkUExURUxpcRCf/xCf/xCf/xCf/xCf/xCf/xCf/xCf/xCf/xCf/xCf/4y/WxEAAAALdFJOUwDa7qM5imsZKL9Udzu63QAAAPZJREFUKM9jYACBNkPtTcIZDHDgLL0bCDaawPil2rvBYFM4hM8yezcU7HQACziCOZpmWauWLQArABmwaVoD3MRKkPwshA0M0UD+5gIEnwVkRQCSAmaQ6UgKGBqBArtADI6loSkgiWyggDhIIBFqlzVQwADI5wI7V4yBQRpqJivEsRYM2qgCGxl2QwVYoD4EC0wAGZoEFQBJSIBdaAQOArCh2yBuDgSbAbJ2I8Sr7Iu1d28GO2y3OdTZrdLbwE5H+LbMAuy53bunoHl/96YI1AACmhuCGoRANbNg5oADGQREHaAijrBoUXZAjygtHFEJj2yERcjJAQB8X6w8eTgurAAAAFd6VFh0UmF3IHByb2ZpbGUgdHlwZSBpcHRjAAB4nOPyDAhxVigoyk/LzEnlUgADIwsuYwsTIxNLkxQDEyBEgDTDZAMjs1Qgy9jUyMTMxBzEB8uASKBKLgDqFxF08kI1lQAAAABJRU5ErkJggg=="/>
+
+    <style rel="stylesheet">
+        * {
+    margin: 0;
+    padding: 0;
+}
+html {
+    box-sizing: border-box;
+}
+
+.fallbackLogo {
+    display: block;
+    margin: 0 auto;
+}
+
+.fallbackProgressbar {
+    margin: 0 auto;
+    margin-top: -80px;
+    height: 26px;
+    padding: 2px;
+    background: #ffffff;
+}
+
+.fallbackIndicator {
+    height: 100%;
+    width:0;
+    background: #189eff;
+}
+
+html, body {
+    width: 100%;
+    height: 100%;
+    background: #fff;
+    animation: fade-background 1s ease-in-out .5s forwards;
+}
+
+.container {
+    position: absolute;
+    top: 50%; left: 50%;
+    padding: 5px;
+    width: 390px;
+    height: 390px;
+    transform: translate(-50%, -50%);
+    text-align: center;
+}
+
+.is--hidden {
+    display: none;
+}
+
+.error--message-container {
+    width: 100%;
+}
+
+.error--message {
+    margin: 20px;
+    padding: 20px;
+    background: #FAECEB;
+    color: #E74C3C;
+    word-wrap: break-word;
+    -webkit-border-radius: 5px;
+    -moz-border-radius: 5px;
+    border-radius: 5px;
+}
+
+.group--logo {
+    stroke-dasharray: 1400;
+    stroke-dashoffset: 1400;
+}
+
+.logo--left {
+    animation: draw-outline 1.5s linear 1.5s forwards;
+}
+
+.logo--right {
+    animation: draw-outline 1.5s linear 2.5s forwards;
+}
+
+.background-ring {
+    cx: 180;
+    cy: 180;
+    r: 110;
+    fill: #fff;
+    stroke: #fff;
+    stroke-width: 3;
+    fill-opacity: 0;
+    stroke-opacity: 0.3;
+    stroke-dasharray: 700;
+    stroke-dashoffset: 700;
+}
+
+.loader-ring {
+    cx: 180;
+    cy: 180;
+    r: 110;
+    stroke: #fff;
+    fill-opacity: 0;
+    stroke-width: 8;
+    stroke-dasharray: 700;
+    stroke-dashoffset: 700;
+    transition: stroke-dashoffset .8s ease-out;
+}
+
+.progress-indicator {
+    r: 120;
+    cx: 180;
+    cy: 180;
+    stroke: #fff;
+    stroke-width: 4;
+    stroke-opacity: 0.3;
+    stroke-dasharray: 7;
+    fill-opacity: 0;
+}
+
+.tick {
+    fill: none;
+    stroke: #189eff;
+    stroke-width: 3;
+    stroke-linejoin: round;
+    stroke-miterlimit: 10;
+    transition: stroke-dashoffset .8s .8s ease-out;
+    stroke-dasharray: 50;
+    stroke-dashoffset: 50;
+}
+
+/** ANIMATIONS */
+.finished--draw-outline {
+    stroke-dashoffset: 0;
+}
+
+.expand-loader .background-ring {
+    animation: expand-loader 1s linear;
+}
+.finished--expand-loader .background-ring {
+    stroke-width: 8;
+    stroke-opacity: 0.25;
+    stroke-dashoffset: 0;
+}
+
+.fadein-fill, .fadein-fill .background-ring {
+    animation: fadein-fill .8s ease-in-out forwards;
+}
+.finished--fadein-fill {
+    fill-opacity: 1;
+}
+
+@keyframes draw-outline {
+    to {
+        stroke-dashoffset: 0;
+    }
+}
+
+@keyframes fadein-fill {
+    to {
+        fill-opacity: 1;
+    }
+}
+
+@keyframes expand-loader {
+    50% {
+        stroke-dashoffset: 0;
+        stroke-width: 3;
+    }
+    to {
+        stroke-dashoffset: 0;
+        stroke-width: 8;
+        stroke-opacity: 0.25;
+    }
+}
+
+@keyframes fade-background {
+    to {
+        background: #189eff;
+    }
+}
+    </style>
+</head>
+<body>
+<div class="error--message-container">
+    <div class="error--message is--hidden"></div>
+</div>
+<div class="container">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 390 390" width="390" height="390">
+        <g fill="#f1f1f1" stroke-width="3" stroke="#fff" fill-opacity="0" transform="scale(0.5), translate(180, 180)"
+           class="group--logo">
+            <path class="logo--left"
+                  d="M291.41 325.43c-15.88-11.96-39.283-21.035-64.067-30.646-29.494-11.437-62.923-24.4-88.023-44.373-28.436-22.63-42.26-51.185-42.26-87.304 0-32.396 13.45-60.105 38.895-80.132C164.487 60.516 207.7 48.647 260.92 48.647c14.704 0 28.76.905 41.777 2.693 1.15.153 2.256-.47 2.73-1.496.49-1.052.238-2.28-.624-3.057C271.25 16.62 227.9.004 182.736.004c-48.812 0-94.703 19.007-129.217 53.52C19.003 88.034 0 133.918 0 182.724c0 48.812 19.007 94.7 53.52 129.206 34.51 34.506 80.4 53.51 129.216 53.51 39.437 0 77.01-12.38 108.656-35.803.663-.49 1.06-1.276 1.063-2.1.004-.824-.388-1.612-1.046-2.106"/>
+            <path class="logo--right"
+                  d="M364.672 165.84c-.06-.696-.4-1.35-.94-1.795-38.132-31.65-68.972-44.558-106.447-44.558-19.998 0-35.33 4.01-45.57 11.92C202.848 138.26 198.16 147.8 198.16 159c0 31.384 38.357 45.688 82.77 62.25 22.888 8.537 46.556 17.363 68.284 29.417.388.217.828.33 1.272.33.306 0 .606-.053.89-.155.714-.257 1.28-.81 1.557-1.516 8.297-21.26 12.504-43.67 12.504-66.603 0-5.387-.257-11.068-.764-16.883"/>
+        </g>
+
+        <g class="group--loading" transform="rotate(270), translate(-360, 0)">
+            <circle cx="180" cy="180" r="110" class="background-ring"></circle>
+            <circle cx="180" cy="180" r="110" class="loader-ring"></circle>
+        </g>
+
+        <polyline transform="translate(55, 50), scale(7)" class="tick" points="11.6,20 15.9,24.2 26.4,13.8 "/>
+    </svg>
+</div>
+
+<script>
+    uri = '<?php echo $scheme; ?>://<?php echo $host; ?>';
+    baseFileName = '/<?php echo basename(__FILE__); ?>'
+    bufferSeparator = '<?php echo BUFFER_SEPARATOR; ?>';
+</script>
+<script>
+    function $(sel, parent) {
+    parent = parent || document;
+    return parent.querySelector(sel);
+}
+
+function ready(cb) {
+    var fallback = new Fallback('.container', 'fallBackMainContainer');
+
+    if (fallback.isFallbackRequired()) {
+        fallback.createFallback();
+        new App(uri, bufferSeparator, true);
+        return;
+    }
+
+    document.addEventListener('DOMContentLoaded', cb, false);
+}
+
+function prefixedEvent(el, type, cb) {
+    var pfx = ['webkit', 'moz', 'MS', 'o', ''];
+    for (var p = 0; p < pfx.length; p++) {
+        if (!pfx[p]) type = type.toLowerCase();
+        el.addEventListener(pfx[p] + type, cb, false);
+    }
+}
+
+function Fallback(elementSelector, fallbackClassName) {
+    this.fallbackClassName = fallbackClassName;
+    this.element = $(elementSelector);
+}
+
+Fallback.prototype.createFallback = function() {
+    this.element.removeChild($('svg'));
+    this.element.appendChild(this.createFallbackElement());
+};
+
+Fallback.prototype.isFallbackRequired = function() {
+    // Internet Explorer
+    var isIE = /*@cc_on!@*/false || !!document.documentMode,
+        // Edge
+        isEdge = !isIE && !!window.StyleMedia;
+
+    return isIE || isEdge;
+};
+
+Fallback.prototype.createFallbackElement = function() {
+    var fallback = document.createElement('div');
+
+    fallback.className = this.fallbackClassName;
+    fallback.innerHTML = this.getTemplate();
+
+    return fallback;
+};
+
+Fallback.prototype.getTemplate = function() {
+    return '' +
+        '<div class="fallbackLogo">' +
+        '   <svg xmlns="http://www.w3.org/2000/svg" viewBox="-20 0 390 390" width="390" height="390" style="margin: 0 auto;">' +
+        '      <g fill="#f1f1f1" stroke-width="3" stroke="#fff" fill-opacity="1" transform="scale(0.5), translate(180, 180)">' +
+        '          <path d="M291.41 325.43c-15.88-11.96-39.283-21.035-64.067-30.646-29.494-11.437-62.923-24.4-88.023-44.373-28.436-22.63-42.26-51.185-42.26-87.304 0-32.396 13.45-60.105 38.895-80.132C164.487 60.516 207.7 48.647 260.92 48.647c14.704 0 28.76.905 41.777 2.693 1.15.153 2.256-.47 2.73-1.496.49-1.052.238-2.28-.624-3.057C271.25 16.62 227.9.004 182.736.004c-48.812 0-94.703 19.007-129.217 53.52C19.003 88.034 0 133.918 0 182.724c0 48.812 19.007 94.7 53.52 129.206 34.51 34.506 80.4 53.51 129.216 53.51 39.437 0 77.01-12.38 108.656-35.803.663-.49 1.06-1.276 1.063-2.1.004-.824-.388-1.612-1.046-2.106"/>' +
+        '          <path d="M364.672 165.84c-.06-.696-.4-1.35-.94-1.795-38.132-31.65-68.972-44.558-106.447-44.558-19.998 0-35.33 4.01-45.57 11.92C202.848 138.26 198.16 147.8 198.16 159c0 31.384 38.357 45.688 82.77 62.25 22.888 8.537 46.556 17.363 68.284 29.417.388.217.828.33 1.272.33.306 0 .606-.053.89-.155.714-.257 1.28-.81 1.557-1.516 8.297-21.26 12.504-43.67 12.504-66.603 0-5.387-.257-11.068-.764-16.883"/>' +
+        '      </g>' +
+        '   </svg>' +
+        '</div>' +
+        '<div class="fallbackProgressbar"><div class="fallbackIndicator"></div></div>';
+};
+
+/**
+ * @param { string } uri
+ * @param { string } bufferSeparator
+ * @param { boolean } requireFallback
+ * @constructor
+ */
+function App(uri, bufferSeparator, requireFallback) {
+    this.hostUrl = uri;
+    this.bufferSeperator = bufferSeparator;
+    this.requireFallback = requireFallback || false;
+    this.init();
+}
+
+App.prototype.init = function() {
+    let urlWithoutParameters = new URL(this.hostUrl);
+    let concatParameter = urlWithoutParameters.search === '' ? '?' : '&';
+
+    urlWithoutParameters.search = '';
+
+    console.log(urlWithoutParameters.toString().replace(baseFileName, '').replace('//', '/') + '/public/recovery/install');
+
+    this.readyResponse = 'ready';
+    this.checkRequirementsUrl = this.hostUrl + concatParameter + 'checkRequirements';
+    this.getVersionUrl = this.hostUrl + concatParameter + 'getVersionData=1';
+    this.downloadUrl = this.hostUrl + concatParameter + 'download=1';
+    this.compareUrl = this.hostUrl + concatParameter + 'compare';
+    this.fileCountUrl = this.hostUrl + concatParameter + 'fileCount';
+    this.unzipUrl = this.hostUrl + concatParameter + 'unzip';
+    this.deleteUrl = this.hostUrl + concatParameter + 'deleteSelf';
+    this.installUrl = urlWithoutParameters.toString().replace(baseFileName, '') + '/public/recovery/install';
+    this.downloadProgressRange = 50;
+    this.unpackProgressRange = 40;
+    this.compareResultStep = 55;
+    this.fileCountStep = 60;
+    this.redirectTimeout = 2000;
+    this.messageBox = new MessageBox('.error--message');
+    this.ajaxHelper = new Ajax(this.messageBox);
+
+    if (this.requireFallback) {
+        this.progressbar = new Progressbar(this.getFallbackProgressbarConfig());
+    } else {
+        this.progressbar = new Progressbar(this.getProgressbarConfig());
+    }
+
+    this.checkRequirements();
+};
+
+App.prototype.getProgressbarConfig = function() {
+    return {
+        elementSelector: '.loader-ring',
+        baseValue: 700,
+        groupLoadingSelector: '.group--loading',
+        tickSelector: '.tick',
+        fadeClass: 'fadein-fill',
+        isFallback: false
+    };
+};
+
+App.prototype.getFallbackProgressbarConfig = function() {
+    return {
+        elementSelector: '.fallbackIndicator',
+        baseValue: 0,
+        groupLoadingSelector: '',
+        tickSelector: '',
+        fadeClass: '',
+        isFallback: true
+    };
+};
+
+App.prototype.checkRequirements = function() {
+    this.ajaxHelper.createRequest(this.checkRequirementsUrl, this.getVersion, this);
+    this.ajaxHelper.startRequest();
+};
+
+App.prototype.getVersion = function(responseText) {
+    if (responseText !== this.readyResponse) {
+        this.messageBox.show(responseText);
+        return;
+    }
+
+    this.ajaxHelper.createRequest(this.getVersionUrl, this.onGetVersion, this);
+    this.ajaxHelper.startRequest();
+
+};
+
+/**
+ * Sets a object to versionData like:
+ * {
+ * "version": "5.6.9",
+ * "release_date": null,
+ * "uri": "http://releases.s3.shopware.com.s3.amazonaws.com/install_5.6.9_be8e9cd9a8f4b7ab6f81c7922e71cbe3c16d78eb.zip",
+ * "size": "45485967",
+ * "sha1": "be8e9cd9a8f4b7ab6f81c7922e71cbe3c16d78eb",
+ * "sha256": "9937cb4f7f3f5570cc75b46f66ecdbdf086def6e62006a370ae662c4e99cbcbc"
+ *   }
+ *
+ * @param { string } responseText
+ */
+App.prototype.onGetVersion = function(responseText) {
+    try {
+        this.versionData = JSON.parse(responseText);
+    } catch (exception) {
+        this.messageBox.show(responseText);
+    }
+
+    this.startDownLoad();
+};
+
+App.prototype.startDownLoad = function() {
+    var url = this.downloadUrl + '&url=' + this.versionData.uri + '&totalSize=' + this.versionData.size;
+
+    this.ajaxHelper.createRequest(url, this.onDownloadProcess, this);
+    this.ajaxHelper.startRequest();
+};
+
+/**
+ * @param { string } responseText
+ */
+App.prototype.onDownloadProcess = function(responseText) {
+    var currentSize;
+
+    if (responseText !== this.readyResponse) {
+        currentSize = this.downloadProgressRange / this.versionData.size * responseText;
+        this.progressbar.update(currentSize);
+        this.startDownLoad();
+        return;
+    }
+
+    this.onDownloadReady(responseText);
+};
+
+/**
+ * @param { string } responseText
+ */
+App.prototype.onDownloadReady = function(responseText) {
+    var lines = responseText.split(this.bufferSeperator);
+
+    if (lines[lines.length - 1] === this.readyResponse) {
+        this.compareFileSha1();
+        return;
+    }
+
+    this.messageBox.show(responseText)
+};
+
+App.prototype.compareFileSha1 = function() {
+    this.ajaxHelper.createRequest(this.compareUrl + '&sha1=' + this.versionData.sha1, this.onGetCompareResult, this);
+    this.ajaxHelper.startRequest();
+};
+
+/**
+ * @param { string } responseText
+ */
+App.prototype.onGetCompareResult = function(responseText) {
+    if (responseText === this.readyResponse) {
+        this.progressbar.update(this.compareResultStep);
+        this.getFileCount();
+        return;
+    }
+
+    this.messageBox.show(responseText);
+};
+
+App.prototype.getFileCount = function() {
+    this.ajaxHelper.createRequest(this.fileCountUrl, this.onGetFileCount, this);
+    this.ajaxHelper.startRequest();
+};
+
+/**
+ * @param { string } responseText
+ */
+App.prototype.onGetFileCount = function(responseText) {
+    if (!isNaN(parseInt(responseText))) {
+        this.fileCount = responseText;
+        this.unzipStep = this.unpackProgressRange / this.fileCount;
+        this.progressbar.update(this.fileCountStep);
+        this.unpackZipFile(0);
+        return;
+    }
+
+    this.messageBox.show(responseText);
+};
+
+App.prototype.unpackZipFile = function(step) {
+    this.ajaxHelper.createRequest(this.unzipUrl + '&step=' + step, this.onUnpackProgress, this);
+    this.ajaxHelper.startRequest();
+};
+
+/**
+ * @param { string|number } responseText
+ */
+App.prototype.onUnpackProgress = function(responseText) {
+    var current;
+
+    if (responseText !== this.readyResponse) {
+        current = this.unzipStep * responseText;
+
+        if(isNaN(responseText)) {
+            this.messageBox.show(responseText);
+            return;
+        }
+
+        this.progressbar.update(current + this.fileCountStep);
+        this.unpackZipFile(responseText);
+        return;
+    }
+
+    this.onUnpackReady(responseText);
+};
+
+/**
+ * Updates the progressbar to value 100 to start the tick animation
+ *
+ * @param { string } responseText
+ */
+App.prototype.onUnpackReady = function(responseText) {
+    if (responseText !== this.readyResponse) {
+        this.messageBox.show(responseText);
+        return;
+    }
+
+    this.progressbar.update(100);
+
+    this.ajaxHelper.createRequest(this.deleteUrl, () => {
+        window.setTimeout(() => {
+            window.location.href = this.installUrl;
+        }, this.redirectTimeout);
+    }, this);
+
+    this.ajaxHelper.startRequest();
+};
+
+/**
+ * @constructor
+ * @param { object } config
+ *
+ * Like:
+ * {
+ *      elementSelector: '.loader-ring',
+ *      baseValue: 700,
+ *      groupLoadingSelector: '.group--loading',
+ *      tickSelector: '.tick',
+ *      fadeClass: 'fadein-fill',
+ *      isFallback: false
+ *  }
+ */
+function Progressbar(config) {
+    this.elementSelector = config.elementSelector;
+    this.baseValue = config.baseValue;
+    this.groupLoadingSelector = config.groupLoadingSelector;
+    this.tickSelector = config.tickSelector;
+    this.fadeClass = config.fadeClass;
+    this.useFallback = config.isFallback;
+
+    this.init();
+}
+
+Progressbar.prototype.init = function() {
+    this.progressBarIndicator = document.querySelector(this.elementSelector);
+};
+
+/**
+ * @param { number } value
+ */
+Progressbar.prototype.update = function(value) {
+    if (!value) {
+        return;
+    }
+
+    if (this.useFallback) {
+        this.progressBarIndicator.style.width = value + '%';
+        return;
+    }
+
+    this.progressBarIndicator.style.strokeDashoffset = Math.floor(this.baseValue - (this.baseValue * (value / 100)));
+
+    if (value === 100) {
+        $(this.groupLoadingSelector).classList.add(this.fadeClass);
+        $(this.tickSelector).style.strokeDashoffset = '0';
+    }
+};
+
+/**
+ * @param { MessageBox } messageBox
+ * @constructor
+ */
+function Ajax(messageBox) {
+    this.messageBox = messageBox;
+    this.loadEventName = 'load';
+    this.progressEventName = 'progress';
+    this.requestMethod = 'POST';
+}
+
+/**
+ * A empty function to call if no callback is defined
+ */
+Ajax.prototype.emptyFunction = function() {};
+
+Ajax.prototype.init = function() {
+    this.request = new XMLHttpRequest();
+
+    if (this.requireProgress) {
+        this.request.addEventListener(this.progressEventName, this.onProgress.bind(this));
+    }
+
+    this.request.addEventListener(this.loadEventName, this.onLoad.bind(this));
+    this.request.open(this.requestMethod, this.url);
+};
+
+/**
+ * @param { string } response
+ */
+Ajax.prototype.onLoad = function(response) {
+    if (this.request.status >= 200 && this.request.status < 300) {
+        this.loadCallback.call(this.scope, response.target.responseText);
+        return;
+    }
+
+    this.messageBox.show(response.srcElement.responseText);
+};
+
+/**
+ * @param { string } response
+ */
+Ajax.prototype.onProgress = function(response) {
+    if (this.request.status >= 200 && this.request.status < 300) {
+        this.progressCallback.call(this.scope, response.target.responseText);
+        return;
+    }
+
+    this.messageBox.show(response.srcElement.responseText);
+};
+
+/**
+ * if no progress callback is passed we dont register the progress event on the request object
+ *
+ * @param { string } url
+ * @param { function } loadCallback
+ * @param { object } scope
+ * @param { function | null } progressCallback
+ */
+Ajax.prototype.createRequest = function(url, loadCallback, scope, progressCallback) {
+    this.url = url;
+    this.loadCallback = loadCallback || this.emptyFunction;
+    this.scope = scope || this;
+    this.progressCallback = progressCallback || false;
+
+    if (typeof this.progressCallback === 'function') {
+        this.requireProgress = true;
+        this.progressCallback = progressCallback;
+    } else {
+        this.requireProgress = false;
+        this.progressCallback = this.emptyFunction;
+    }
+
+    this.init();
+};
+
+Ajax.prototype.startRequest = function() {
+    this.request.send();
+};
+
+/**
+ * @param { string } elementSelector
+ *
+ * @constructor
+ */
+function MessageBox(elementSelector) {
+    this.elementSelector = elementSelector;
+    this.isHiddenClass = 'is--hidden';
+
+    this.init();
+}
+
+MessageBox.prototype.init = function() {
+    this.element = document.querySelector(this.elementSelector);
+};
+
+/**
+ * if it is required to show a message throw a exception to stop the javascript
+ *
+ * @param { string } message
+ */
+MessageBox.prototype.show = function(message) {
+    this.element.innerHTML = message.trim().replace(/^<br.+?>/, '');
+    this.element.classList.remove(this.isHiddenClass);
+
+    throw message;
+};
+
+ready(function() {
+    var groupLogo = $('.group--logo'),
+        groupLoading = $('.group--loading');
+
+    prefixedEvent(groupLogo, 'animationend', function(event) {
+        var aniName = event.animationName;
+
+        groupLogo.classList.add('finished--' + aniName);
+
+        switch (aniName) {
+            case 'draw-outline':
+                groupLogo.classList.add('fadein-fill');
+                break;
+            case 'fadein-fill':
+                groupLoading.classList.add('expand-loader');
+                break;
+        }
+    });
+
+    prefixedEvent(groupLoading, 'animationend', function(event) {
+        var aniName = event.animationName;
+
+        groupLoading.classList.add('finished--' + aniName);
+
+        switch (aniName) {
+            case 'expand-loader':
+                new App(uri, bufferSeparator, false);
+        }
+    });
+});
+</script>
+</body>
+</html>
