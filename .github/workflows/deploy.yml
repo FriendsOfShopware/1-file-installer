@@ -12,6 +12,7 @@ jobs:
           mkdir build
           php compile.php
           mv install.php build
+          mv _redirects build
 
       - name: Deploy
         uses: JamesIves/github-pages-deploy-action@4.1.1
