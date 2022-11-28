@@ -4,7 +4,7 @@
 
 # Usage
 
-* Download the install.php and upload the file to your webspace
+* Download the [install.php](https://install.fos.gg) and upload the file to your webspace
     * or `wget -O install.php https://install.fos.gg` in the Shell
 
 * Request the page with /install.php and the installer downloads latest Shopware 6 and unpacks it to the current folder
